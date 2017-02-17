@@ -5,12 +5,14 @@
 #include "Logging.as";
 #include "RulesCore.as";
 #include "XMLParser.as";
+#include "KnightCommon.as";
 
 
 const int    AR_RECORDING_VERSION = 2;   // the version number for the file format. If the format changes this should be changed.
 const string AR_RECORDING_DIRECTORY = "../Cache"; // the directory where recording files are loaded from.
 const float  AR_POS_RUBBERBAND_SNAP   = 4.0; // If a blob's position strays more than this amount from it's recorded value then it will be moved.
 const float  AR_VEL_RUBBERBAND_SNAP   = 0.2; // If a blob's velocity strays more than this amount from it's recorded value then it will be moved.
+const bool   AR_ENABLE_KNIGHT_SPECIFIC_DATA = true;
 const keys[] AR_ALL_KEYS = {
     key_up,
     key_down,
@@ -187,6 +189,10 @@ class ModState {
             return;
         }
 
+        if (!currentRecording.ended) {
+            currentRecording.end();
+        }
+
         string saveFile = getSaveFileName_();
         ServerMsg("Saving current recording to " + saveFile);
         string matchString = currentRecording.serialize();
@@ -321,9 +327,15 @@ class MatchRecording {
     BlobMeta[]      allBlobMeta; // BlobMeta for all blobs that appear in the match
     BlobData[][]    recording;   // Contains an array of BlobData for every game tick
     u32             initT;       // the rec time at which the mod started recording
-    u32             endT = 0;    // the rec time at the which the mod stopped recording
+    u32             endT;    // the rec time at the which the mod stopped recording
     string          mapName;
     int             winningTeam;
+    bool            ended; // whether end() has been called. this value is not serialzied
+
+    MatchRecording() {
+        endT = 0;
+        ended = false;
+    }
 
     u32 getNumRecordedTicks() {
         return recording.length();
@@ -350,12 +362,24 @@ class MatchRecording {
 
     // Should be called to end the recording
     void end() {
+        ended = true;
         endT = getGameTime();
-        winningTeam = getRules().getTeamWon();
+
+        if (getRules().getCurrentState() == GAME_OVER) {
+            winningTeam = getRules().getTeamWon();
+        }
+        else {
+            winningTeam = -1;
+        }
     }
 
     void recordTick() {
         //log("MatchRecording#recordTick", "called");
+        if (ended) {
+            log("MatchRecording#recordTick", "Recording is ended so refusing to record tick.");
+            return;
+        }
+
         CBlob@[] allBlobs;
         getBlobs(allBlobs);
         BlobData[] tickRecording;
@@ -821,6 +845,15 @@ class BlobData {
     Vec2f   aimPos;
     uint16  keys;
     float   health;
+    // Knight specific stuff
+    bool    useKnightData = false;
+    u8      knocked;
+    u8      knightState;
+    u8      swordTimer;
+    u8      shieldTimer;
+    bool    doubleSlash;
+    u32     slideTime;
+    u32     shieldDown;
 
     BlobData() {} // for when loading from a file
 
@@ -832,6 +865,23 @@ class BlobData {
         aimPos = vars.aimpos;
         keys = vars.keys;
         health = blob.getHealth();
+
+        if (AR_ENABLE_KNIGHT_SPECIFIC_DATA && blob.getName() == "knight") {
+            useKnightData = true;
+            KnightInfo@ knight;
+            bool exists = blob.get("knightInfo", @knight);
+            if (!exists) {
+                log("BlobData", "ERROR couldn't get knightInfo from knight");
+                return;
+            }
+            knocked = blob.get_u8("knocked");
+            knightState = knight.state;
+            swordTimer = knight.swordTimer;
+            shieldTimer = knight.shieldTimer;
+            doubleSlash = knight.doubleslash;
+            slideTime = knight.slideTime;
+            shieldDown = knight.shield_down;
+        }
     }
 
     string serialize() {
@@ -843,6 +893,16 @@ class BlobData {
         result += "<aimpos>" + aimPos.x + "," + aimPos.y + "</aimpos>";
         result += "<keys>" + keys + "</keys>";
         result += "<health>" + health + "</health>";
+
+        if (useKnightData) {
+            result += "<knocked>" + knocked + "</knocked>";
+            result += "<knightstate>" + knightState + "</knightstate>";
+            result += "<swordtimer>" + swordTimer + "</swordtimer>";
+            result += "<shieldtimer>" + shieldTimer + "</shieldtimer>";
+            result += "<doubleslash>" + doubleSlash + "</doubleslash>";
+            result += "<slidetime>" + slideTime + "</slidetime>";
+            result += "<shielddown>" + shieldDown + "</shielddown>";
+        }
 
         result += "</blobdata>";
 
