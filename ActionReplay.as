@@ -1,15 +1,16 @@
-// Some important concepts
-// 'recorded time' means a time returned by getGameTime() in the original recorded match
-// 'fake time' refers to a recorded time. So if a match was recorded from ticks 10-100 then valid fake times are 10-100.
-// 'sim time' means a time returned by getGameTime() but in the simulation
+// This script is used for recording/replaying games.
+// Class methods or functions ending in _ are considered private.
 #define SERVER_ONLY
 
 #include "Logging.as";
 #include "RulesCore.as";
+#include "XMLParser.as";
 
 
-const int AR_RECORDING_VERSION = 1; // the version number for recording files. If the format changes this should be changed.
-const float AR_RUBBERBAND_SNAP = 4.0; // If a blob's position strays more than this amount from it's recorded value then it will be moved.
+const int    AR_RECORDING_VERSION = 2;   // the version number for the file format. If the format changes this should be changed.
+const string AR_RECORDING_DIRECTORY = "../Cache"; // the directory where recording files are loaded from.
+const float  AR_POS_RUBBERBAND_SNAP   = 4.0; // If a blob's position strays more than this amount from it's recorded value then it will be moved.
+const float  AR_VEL_RUBBERBAND_SNAP   = 0.2; // If a blob's velocity strays more than this amount from it's recorded value then it will be moved.
 const keys[] AR_ALL_KEYS = {
     key_up,
     key_down,
@@ -30,120 +31,193 @@ const keys[] AR_ALL_KEYS = {
 
 
 enum ARMode {
-    recording = 0,
+    idle = 0,
+    recording,
     replaying,
-    idle
+    // in autorecording mode, whenever a game starts a new recording will be started.
+    // when a game enters game over state, the recording will be saved.
+    autorecording,
+    // in autoreplaying mode, all recordings with a certain name prefix are played sequentially
+    // the name prefix is in ModState.
+    autoreplaying
 }
 
 
-/* The current state of the mod
- */
+// The current state of the mod; whether it is recording or replaying etc.
 class ModState {
-    bool            autorecord = false;     // if true then matches are automatically recorded on state and saved on game over
-    ARMode          mode = ARMode::idle;    // the current mode
-    bool            hasRecording = false;   // whether we have a currentRecording
+    ARMode          mode;             // the current mode
+    bool            hasRecording;     // whether we have a currentRecording
     MatchRecording  currentRecording;
+    bool            hasReplay;        // whether we have a currentReplay
     MatchReplay     currentReplay;
+    string          autoreplayMatchPrefix; // if the matches are named 'tournamentmatch0.cfg', 'tournamentmatch1.cfg' etc. then this is 'tournamentmatch'
+    int             autoreplayCurrentMatch; // the number of the currently replaying match
+    int             autoreplayMaxMatch;
 
-    bool isRecording() {
-        return mode == ARMode::recording;
-    }
-
-    bool isReplaying() {
-        return mode == ARMode::replaying;
+    ModState() {
+        mode = ARMode::idle;
     }
 
     void startRecording() {
-        if (isRecording()) {
-            log("ModState#startRecording", "WARN: already recording");
+        if (mode == ARMode::recording) {
+            ServerMsg("Already recording!");
             return;
         }
-        getNet().server_SendMsg("Starting to record match.");
+        else if (mode != ARMode::idle) {
+            ServerMsg("Can't start recording, already in state " + modeToString_(mode));
+            return;
+        }
+        ServerMsg("Starting to record.");
 
         mode = ARMode::recording;
-        currentRecording = MatchRecording();
-        currentRecording.start();
-        hasRecording = true;
+        newRecording_();
     }
 
     void stopRecording() {
-        if (!isRecording()) {
-            log("ModState#stopRecording", "WARN: not actually recording");
+        if (mode != ARMode::recording) {
+            ServerMsg("Not currently recording.");
             return;
         }
-        getNet().server_SendMsg("Stopping recording.");
 
+        ServerMsg("Stopping recording.");
         mode = ARMode::idle;
         currentRecording.end();
     }
 
-    void saveRecording() {
-        if (!hasRecording) {
-            log("ModState#saveRecording", "WARN: don't have a current recording");
-            return;
-        }
-        else if (isRecording()) {
-            stopRecording();
-        }
-        getNet().server_SendMsg("Saving current recording...");
-
-        // Set in onInit
-        string sessionName = getRules().get_string("AR session name");
-        // Set in onRestart
-        int matchNumber = getRules().get_u16("AR match number");
-        int recordingNumber = getRules().get_u16("AR recording number");
-
-        string saveFile = sessionName + "_match" + matchNumber + "recording" + recordingNumber + ".cfg";
-        log("ModState#saveRecording", "Save file is: " + saveFile);
-        getNet().server_SendMsg("Saving to: " + saveFile);
-        string matchString = currentRecording.serialize();
-
-        log("ModState#saveRecording", "Writing to save file...");
-        ConfigFile cfg();
-        cfg.add_string("data", matchString);
-        cfg.saveFile(saveFile);
-        getRules().set_u16("AR recording number", recordingNumber+1);
-        log("ModState#saveRecording", "Done!");
-    }
-
     void startReplaying() {
-        if (isReplaying()) {
-            getNet().server_SendMsg("Already replaying!");
+        if (mode == ARMode::replaying) {
+            ServerMsg("Already replaying!");
             return;
         }
-        else if (autorecord) {
-            getNet().server_SendMsg("Can't replay while in autorecord mode");
+        else if (mode != ARMode::idle) {
+            ServerMsg("Can't start replaying, already in state " + modeToString_(mode));
             return;
         }
-        getNet().server_SendMsg("Starting to replay");
+        else if (!hasRecording) {
+            ServerMsg("No current recording to replay.");
+            return;
+        }
 
+        ServerMsg("Starting replay.");
         mode = ARMode::replaying;
-        currentReplay = MatchReplay(currentRecording);
+        currentReplay = MatchReplay(@currentRecording);
         currentReplay.start();
+        hasReplay = true;
     }
 
     void stopReplaying() {
-        if (!isReplaying()) {
-            log("ModState#stopReplaying", "WARN: not actually replaying");
+        if (mode != ARMode::replaying) {
+            ServerMsg("Not currently replaying.");
             return;
         }
-        getNet().server_SendMsg("Stopping replay.");
 
+        ServerMsg("Stopping replay.");
         mode = ARMode::idle;
+        hasReplay = false;
         LoadMap(currentReplay.match.mapName);
     }
 
-    // Should be called every tick if not in idle mode
-    void update() {
-        //log("ModState#update", "Updating");
+    void startAutorecording() {
+        if (mode == ARMode::autorecording) {
+            ServerMsg("Already autorecording!");
+            return;
+        }
+        else if (mode != ARMode::idle) {
+            ServerMsg("Can't start autorecording, already in state " + modeToString_(mode));
+            return;
+        }
 
-        if (mode == ARMode::recording) {
+        ServerMsg("Autorecording activated.");
+        mode = ARMode::autorecording;
+        hasRecording = false;
+    }
+
+    void stopAutorecording() {
+        if (mode != ARMode::autorecording) {
+            ServerMsg("Not currently autorecording.");
+            return;
+        }
+
+        ServerMsg("Stopping autorecording.");
+        mode = ARMode::idle;
+
+        if (hasRecording) {
+            currentRecording.end();
+        }
+    }
+
+    void startAutoreplaying(string matchPrefix, int maxMatch) {
+        if (mode == ARMode::autoreplaying) {
+            ServerMsg("Already autoreplaying!");
+            return;
+        }
+        else if (mode != ARMode::idle) {
+            ServerMsg("Can't start autoreplaying, already in state " + modeToString_(mode));
+            return;
+        }
+
+        ServerMsg("Autoreplaying activated.");
+        mode = ARMode::autoreplaying;
+        autoreplayMatchPrefix = matchPrefix;
+        autoreplayCurrentMatch = 0;
+        autoreplayMaxMatch = maxMatch;
+        hasReplay = false;
+
+        playNextAutoreplayMatch_();
+    }
+
+    void stopAutoreplaying() {
+        if (mode != ARMode::autoreplaying) {
+            ServerMsg("Not currently autoreplaying.");
+            return;
+        }
+
+        ServerMsg("Stopping autoreplaying.");
+        mode = ARMode::idle;
+
+        if (hasReplay) {
+            LoadMap(currentReplay.match.mapName);
+        }
+        hasReplay = false;
+    }
+
+    void saveRecording() {
+        if (!hasRecording) {
+            ServerMsg("No current recording to save.");
+            return;
+        }
+
+        string saveFile = getSaveFileName_();
+        ServerMsg("Saving current recording to " + saveFile);
+        string matchString = currentRecording.serialize();
+        ConfigFile cfg();
+        cfg.add_string("data", matchString);
+        bool success = cfg.saveFile(saveFile);
+        if (!success) {
+            ServerMsg("Error saving file.");
+        }
+        else {
+            ServerMsg("Saved successfully.");
+        }
+    }
+
+    void onTick() {
+        if (mode == ARMode::recording || mode == ARMode::autorecording) {
             currentRecording.recordTick();
         }
         else if (mode == ARMode::replaying) {
             if (currentReplay.isFinished()) {
-                //log("ModState#update", "Looping current replay");
+                ServerMsg("Looping current replay");
                 currentReplay.start();
+            }
+            else {
+                currentReplay.update();
+            }
+        }
+        else if (mode == ARMode::autoreplaying) {
+            if (currentReplay.isFinished()) {
+                ServerMsg("Loading next replay");
+                playNextAutoreplayMatch_();
             }
             else {
                 currentReplay.update();
@@ -151,26 +225,105 @@ class ModState {
         }
     }
 
+    void onRestart() {
+        if (mode == ARMode::autorecording) {
+            ServerMsg("Autorecording is enabled. Starting to record the match.");
+            newRecording_();
+        }
+    }
+
+    void onGameOver() {
+        if (mode == ARMode::autorecording) {
+            if (hasRecording) {
+                ServerMsg("Autorecording is enabled. Saving the current recording.");
+                currentRecording.end();
+                saveRecording();
+            }
+            else {
+                ServerMsg("Autorecording is enabled but there's no current recording.");
+            }
+        }
+        else if (mode == ARMode::autoreplaying) {
+            playNextAutoreplayMatch_();
+        }
+    }
+
     void debug() {
-        log("ModState#debug", "mode: " + mode);
+        log("ModState#debug", "mode: " + modeToString_(mode));
+    }
+
+    void playNextAutoreplayMatch_() {
+        for (int i=autoreplayCurrentMatch+1; i < autoreplayMaxMatch; i++) {
+            string fileName = autoreplayMatchPrefix + i + ".cfg";
+            string filePath = AR_RECORDING_DIRECTORY + "/" + fileName;
+
+            log("ModState#playNextAutoreplayMatch_", "Next file is " + filePath);
+
+            MatchRecording match();
+            bool success = match.loadFromFile(filePath);
+
+            if (!success) {
+                continue;
+            }
+            else {
+                hasReplay = true;
+                currentReplay = MatchReplay(@match);
+                currentReplay.start();
+                autoreplayCurrentMatch = i;
+                return;
+            }
+        }
+
+        ServerMsg("No more matches.");
+        stopAutoreplaying();
+    }
+
+    void newRecording_() {
+        currentRecording = MatchRecording();
+        currentRecording.start();
+        hasRecording = true;
+    }
+
+    string getSaveFileName_() {
+        string sessionName = getRules().get_string("AR session name"); // Set in onInit
+        int matchNumber = getRules().get_u16("AR match number"); // Set in onRestart
+        int recordingNumber = getRules().get_u16("AR recording number");
+        getRules().set_u16("AR recording number", recordingNumber+1); // increment for next time
+
+        string saveFile = sessionName + "_match" + matchNumber + "recording" + recordingNumber + ".cfg";
+        return saveFile;
+    }
+
+    string modeToString_(u8 mode) {
+        switch (mode) {
+            case ARMode::idle:
+                return "idle";
+            case ARMode::recording:
+                return "recording";
+            case ARMode::replaying:
+                return "replaying";
+            case ARMode::autorecording:
+                return "autorecording";
+            case ARMode::autoreplaying:
+                return "autoreplaying";
+            default:
+                log("ModState#debug", "ERROR: invalid mode " + mode);
+                break;
+        }
+
+        return "INVALID MODE";
     }
 }
 
 
-/* Represents a recording of a match.
- * This could be just a part of a match, or the whole thing.
- */
+// Represents a recording of a match. Could be all of it or just part of it.
 class MatchRecording {
     BlobMeta[]      allBlobMeta; // BlobMeta for all blobs that appear in the match
     BlobData[][]    recording;   // Contains an array of BlobData for every game tick
-    dictionary      saves;       // maps string save names like 'before i died' to rec times
     u32             initT;       // the rec time at which the mod started recording
     u32             endT = 0;    // the rec time at the which the mod stopped recording
     string          mapName;
-
-    int getNumSaves() {
-        return saves.getSize();
-    }
+    int             winningTeam;
 
     u32 getNumRecordedTicks() {
         return recording.length();
@@ -190,7 +343,7 @@ class MatchRecording {
             CBlob@ blob = allBlobs[i];
             if (shouldRecordBlob_(blob)) {
                 log("MatchRecording#start", "Creating blob meta for " + blob.getNetworkID());
-                addBlobMeta(blob);
+                addBlobMeta_(blob);
             }
         }
     }
@@ -198,6 +351,7 @@ class MatchRecording {
     // Should be called to end the recording
     void end() {
         endT = getGameTime();
+        winningTeam = getRules().getTeamWon();
     }
 
     void recordTick() {
@@ -211,10 +365,10 @@ class MatchRecording {
 
             if (shouldRecordBlob_(blob)) {
                 BlobData bd(blob);
-                
+
                 // New blob found
                 if (getBlobMeta(bd.netid) is null) {
-                    addBlobMeta(blob);
+                    addBlobMeta_(blob);
                 }
 
                 //bd.debug();
@@ -230,15 +384,35 @@ class MatchRecording {
         log("MatchRecording#createSavePoint", "NOT IMPLEMENTED YET");
     }
 
+    void debug() {
+        log("MatchRecording#debug", "num recorded ticks: " + getNumRecordedTicks() +
+                ", initT: " + initT +
+                ", endT: " + endT);
+    }
+
+    BlobMeta@ getBlobMeta(u16 netid) {
+        // Returns the saved BlobMeta object for a blob with the given id
+        // or null if it isn't saved
+        for (int i=0; i < allBlobMeta.length(); i++) {
+            BlobMeta meta = allBlobMeta[i];
+            if (meta.netid == netid) {
+                return @meta;
+            }
+        }
+
+        return null;
+    }
+
     // Turns the recording into a string for saving
     string serialize() {
         log("MatchRecording#serialize", "Serializing match recording...");
         string result = "<matchrecording>";
 
         result += "<version>" + AR_RECORDING_VERSION + "</version>";
-        result += "<initT>" + initT + "</initT>";
-        result += "<endT>" + endT + "</endT>";
+        result += "<initt>" + initT + "</initt>";
+        result += "<endt>" + endT + "</endt>";
         result += "<mapname>" + mapName + "</mapname>";
+        result += "<winningteam>" + winningTeam + "</winningteam>";
 
         result += "<allblobmeta>";
         for (int i=0; i < allBlobMeta.length(); i++) {
@@ -262,28 +436,167 @@ class MatchRecording {
         return result;
     }
 
-    void debug() {
-        log("MatchRecording#debug", "num recorded ticks: " + getNumRecordedTicks() +
-                ", num saves: " + getNumSaves() +
-                ", initT: " + initT +
-                ", endT: " + endT);
-    }
-
-    BlobMeta@ getBlobMeta(u16 netid) {
-        // Returns the saved BlobMeta object for a blob with the given id
-        // or null if it isn't saved
-        for (int i=0; i < allBlobMeta.length(); i++) {
-            BlobMeta meta = allBlobMeta[i];
-            if (meta.netid == netid) {
-                return @meta;
-            }
+    bool loadFromFile(string filePath) {
+        log("MatchRecording#loadFromFile", "Trying to load from " + filePath);
+        ConfigFile cfg();
+        bool check = cfg.loadFile(filePath);
+        if (!check) {
+            log("MatchRecording#loadFromFile", "Cfg couldn't load " + filePath);
+            return false;
         }
 
-        return null;
+        string data = cfg.read_string("data");
+        if (data.length() == 0) {
+            log("MatchRecording#loadFromFile", "file data is empty");
+            return false;
+        }
+
+        return deserialize(data);
     }
 
-    void addBlobMeta(CBlob@ blob) {
-        log("MatchRecording#addBlobMeta", "Adding blob meta for " + blob.getName() + " (" + blob.getNetworkID() + ")");
+    bool deserialize(string data) {
+        log("MatchRecording#deserialize", "Beginning deserialization...");
+        XMLParser parser(data);
+        XMLDocument@ doc = parser.parse();
+
+        if (doc is null || doc.root is null || doc.root.name != "matchrecording") {
+            log("MatchRecording#deserialize", "Invalid data.");
+            return false;
+        }
+
+        XMLElement@ el; // current element
+
+        @el = doc.root.getFirstChild("version");
+        if (el is null) { return deserializeFailure_("version"); }
+        if (parseInt(el.value) != AR_RECORDING_VERSION) {
+            log("MatchRecording#deserialize", "WARN Trying to load from an old recording format");
+        }
+
+        @el = doc.root.getFirstChild("initt");
+        if (el is null) { return deserializeFailure_("initt"); }
+        initT = parseInt(el.value);
+
+        @el = doc.root.getFirstChild("endt");
+        if (el is null) { return deserializeFailure_("endt"); }
+        endT = parseInt(el.value);
+
+        @el = doc.root.getFirstChild("mapname");
+        if (el is null) { return deserializeFailure_("mapname"); }
+        mapName = el.value;
+
+        XMLElement@ el_allblobmeta = doc.root.getFirstChild("allblobmeta");
+        if (el_allblobmeta is null) { return deserializeFailure_("allblobmeta"); }
+
+        for (int i=0; i < el_allblobmeta.children.length(); i++) {
+            XMLElement@ el_blobmeta = el_allblobmeta.children[i];
+            if (el_blobmeta is null) { return deserializeFailure_("blobmeta"); }
+
+            BlobMeta meta();
+            @el = el_blobmeta.getFirstChild("netid");
+            if (el is null) { return deserializeFailure_("netid"); }
+            meta.netid = parseInt(el.value);
+
+            @el = el_blobmeta.getFirstChild("name");
+            if (el is null) { return deserializeFailure_("name"); }
+            meta.name = el.value;
+
+            @el = el_blobmeta.getFirstChild("teamnum");
+            if (el is null) { return deserializeFailure_("teamnum"); }
+            meta.teamNum = parseInt(el.value);
+
+            @el = el_blobmeta.getFirstChild("sexnum");
+            if (el is null) { return deserializeFailure_("sexnum"); }
+            meta.sexNum = parseInt(el.value);
+
+            @el = el_blobmeta.getFirstChild("headnum");
+            if (el is null) { return deserializeFailure_("sexnum"); }
+            meta.sexNum = parseInt(el.value);
+
+            @el = el_blobmeta.getFirstChild("playerid");
+            if (el is null) { return deserializeFailure_("playerid"); }
+            meta.playerid = parseInt(el.value);
+
+            @el = el_blobmeta.getFirstChild("playerusername");
+            if (el is null) { return deserializeFailure_("playerusername"); }
+            meta.playerUsername = parseInt(el.value);
+
+            @el = el_blobmeta.getFirstChild("playercharname");
+            if (el is null) { return deserializeFailure_("playercharname"); }
+            meta.playerCharacterName = parseInt(el.value);
+
+            allBlobMeta.push_back(meta);
+        }
+
+        XMLElement@ el_recording = doc.root.getFirstChild("recording");
+        if (el_recording is null) { return deserializeFailure_("recording"); }
+
+        for (int i=0; i < el_recording.children.length(); i++) {
+            XMLElement@ el_tick = el_recording.children[i];
+            if (el_tick is null) { return deserializeFailure_("tick"); }
+
+            BlobData[] tick;
+
+            for (int j=0; j < el_tick.children.length(); j++) {
+                XMLElement@ el_blobdata = el_tick.children[j];
+                if (el_blobdata is null) { return deserializeFailure_("blobdata"); }
+
+                BlobData bd();
+                @el = el_blobdata.getFirstChild("netid");
+                if (el is null) { return deserializeFailure_("netid"); }
+                bd.netid = parseInt(el.value);
+
+                @el = el_blobdata.getFirstChild("position");
+                if (el is null) { return deserializeFailure_("position"); }
+                string[]@ positionParts = el.value.split(",");
+                if (positionParts.length() != 2) {
+                    log("MatchRecording#deserialize", "Incorrect number of position parts: " + positionParts.length());
+                    return false;
+                }
+                bd.position = Vec2f(parseFloat(positionParts[0]), parseFloat(positionParts[1]));
+
+                @el = el_blobdata.getFirstChild("velocity");
+                if (el is null) { return deserializeFailure_("velocity"); }
+                string[]@ velocityParts = el.value.split(",");
+                if (velocityParts.length() != 2) {
+                    log("MatchRecording#deserialize", "Incorrect number of velocity parts: " + velocityParts.length());
+                    return false;
+                }
+                bd.velocity = Vec2f(parseFloat(velocityParts[0]), parseFloat(velocityParts[1]));
+
+                @el = el_blobdata.getFirstChild("aimpos");
+                if (el is null) { return deserializeFailure_("aimpos"); }
+                string[]@ aimposParts = el.value.split(",");
+                if (aimposParts.length() != 2) {
+                    log("MatchRecording#deserialize", "Incorrect number of aimpos parts: " + aimposParts.length());
+                    return false;
+                }
+                bd.aimPos = Vec2f(parseFloat(aimposParts[0]), parseFloat(aimposParts[1]));
+
+                @el = el_blobdata.getFirstChild("keys");
+                if (el is null) { return deserializeFailure_("keys"); }
+                bd.keys = parseInt(el.value);
+
+                @el = el_blobdata.getFirstChild("health");
+                if (el is null) { return deserializeFailure_("health"); }
+                bd.health = parseFloat(el.value);
+
+                tick.push_back(bd);
+            }
+
+            recording.push_back(tick);
+        }
+
+        log("MatchRecording#deserialize", "Deserialization successful!");
+        return true;
+    }
+
+    bool deserializeFailure_(string tagName) {
+        log("MatchRecording#deserialize", "Deserialization failed: missing element " + tagName);
+        return false;
+    }
+
+    void addBlobMeta_(CBlob@ blob) {
+        log("MatchRecording#addBlobMeta_", "Adding blob meta for " + blob.getName() + " (" + blob.getNetworkID() + ")");
         BlobMeta meta(blob);
         meta.debug();
         allBlobMeta.push_back(meta);
@@ -300,25 +613,29 @@ class MatchRecording {
 /* The state of a match replay
  */
 class MatchReplay {
-    u32 fakeT = 0;
+    u32 replayT = 0;
     dictionary recToSimIDs; // maps recorded blob network ids to their ids in the current simulation
-    MatchRecording match;
+    MatchRecording@ match;
 
-    MatchReplay(MatchRecording _match) {
-        match = _match;
+    MatchReplay(MatchRecording@ _match) {
+        @match = _match;
     }
 
     void update() {
-        fakeT++;
+        if (getMap().getMapName() != match.mapName) {
+            log("MatchReplay#update", "ERROR current map doesn't match the map of the recording");
+            return;
+        }
+        replayT++;
         replayTick_();
     }
 
     bool isFinished() {
-        return fakeT >= match.recording.length() - 1;
+        return replayT >= match.recording.length() - 1;
     }
 
     void debug() {
-        log("MatchReplay#debug", "fakeT: " + fakeT);
+        log("MatchReplay#debug", "replayT: " + replayT);
     }
 
     // Starts the replay
@@ -329,22 +646,27 @@ class MatchReplay {
             return;
         }
 
-        // Kill everything in the current simulation
         AllSpec();
-        KillAllBlobs();
 
-        fakeT = 0;
+        if (getMap().getMapName() == match.mapName) {
+            KillAllBlobs();
+        }
+        else {
+            LoadMap(match.mapName);
+        }
+
+        replayT = 0;
         recToSimIDs.deleteAll();
         replayTick_();
     }
 
     void replayTick_() {
-        if (fakeT >= match.recording.length()) {
-            log("MatchReplay#replayTick_", "fakeT exceeds match time");
+        if (replayT >= match.recording.length()) {
+            log("MatchReplay#replayTick_", "replayT exceeds match time");
             return;
         }
 
-        BlobData[] tickRecording = match.recording[fakeT];
+        BlobData[] tickRecording = match.recording[replayT];
 
         for (int i=0; i < tickRecording.length(); i++) {
             BlobData datum = tickRecording[i];
@@ -387,10 +709,15 @@ class MatchReplay {
     }
 
     void replayBlob_(CBlob@ blob, BlobData datum) {
-        if ((datum.position - blob.getPosition()).Length() > AR_RUBBERBAND_SNAP) {
-            // Snap blob to recorded position if it strays too far
+        // Snap blob to recorded position if it strays too far
+        if ((datum.position - blob.getPosition()).Length() > AR_POS_RUBBERBAND_SNAP) {
             blob.setPosition(datum.position);
         }
+        // Snap blob velocity to recorded velocity if it strays too far
+        if ((datum.velocity - blob.getVelocity()).Length() > AR_VEL_RUBBERBAND_SNAP) {
+            blob.setVelocity(datum.velocity);
+        }
+
         blob.setAimPos(datum.aimPos);
 
         for (int i=0; i < AR_ALL_KEYS.length; i++) {
@@ -418,21 +745,24 @@ class MatchReplay {
             return blob;
         }
     }
-
 }
 
 
-/* Information about a blob that should not change over time.
- */
+// Information about a blob that should not change over time.
 class BlobMeta {
     u16     netid;
     string  name;
     int     teamNum;
-    u16     playerid                = 0;
+    u16     playerid;
     string  playerUsername;
     string  playerCharacterName;
     int     sexNum;
     int     headNum;
+
+    BlobMeta() {
+        // For when loading from a file
+        playerid = 0;
+    }
 
     BlobMeta(CBlob@ blob) {
         netid   = blob.getNetworkID();
@@ -447,6 +777,9 @@ class BlobMeta {
             playerUsername = player.getUsername();
             playerCharacterName = player.getCharacterName();
         }
+        else {
+            playerid = 0;
+        }
     }
 
     bool hasPlayer() {
@@ -458,9 +791,9 @@ class BlobMeta {
 
         result += "<netid>" + netid + "</netid>";
         result += "<name>" + name + "</name>";
-        result += "<teamNum>" + teamNum + "</teamNum>";
-        result += "<sexNum>" + sexNum + "</sexNum>";
-        result += "<headNum>" + headNum + "</headNum>";
+        result += "<teamnum>" + teamNum + "</teamnum>";
+        result += "<sexnum>" + sexNum + "</sexnum>";
+        result += "<headnum>" + headNum + "</headnum>";
 
         if (hasPlayer()) {
             result += "<playerid>" + playerid + "</playerid>";
@@ -474,12 +807,7 @@ class BlobMeta {
     }
 
     void debug() {
-        log("BlobMeta#debug", "netid: " + netid +
-                ", name: " + name + 
-                ", teamNum: " + teamNum +
-                ", playerid: " + playerid +
-                ", playerUsername: " + playerUsername +
-                ", playerCharacterName: " + playerCharacterName);
+        log("BlobMeta#debug", serialize());
     }
 }
 
@@ -489,13 +817,17 @@ class BlobMeta {
 class BlobData {
     u16     netid;
     Vec2f   position;
+    Vec2f   velocity;
     Vec2f   aimPos;
     uint16  keys;
     float   health;
 
+    BlobData() {} // for when loading from a file
+
     BlobData(CBlob@ blob) {
         netid = blob.getNetworkID();
         position = blob.getPosition();
+        velocity = blob.getVelocity();
         MovementVars@ vars = blob.getMovement().getVars();
         aimPos = vars.aimpos;
         keys = vars.keys;
@@ -507,6 +839,7 @@ class BlobData {
 
         result += "<netid>" + netid + "</netid>";
         result += "<position>" + position.x + "," + position.y + "</position>";
+        result += "<velocity>" + velocity.x + "," + velocity.y + "</velocity>";
         result += "<aimpos>" + aimPos.x + "," + aimPos.y + "</aimpos>";
         result += "<keys>" + keys + "</keys>";
         result += "<health>" + health + "</health>";
@@ -517,11 +850,7 @@ class BlobData {
     }
 
     void debug() {
-        log("BlobData#debug", "netid: " + netid +
-                ", position: " + stringVec2f(position) + 
-                ", aimPos: " + stringVec2f(aimPos) +
-                ", keys: " + keys +
-                ", health: " + health);
+        log("BlobData#debug", serialize());
     }
 }
 
@@ -530,35 +859,30 @@ class BlobData {
 ModState STATE();
 
 // Hooks
+void onReload(CRules@ this) {
+    //XMLTests();
+}
+
 void onInit(CRules@ this) {
+    // Putting these properties in the Rules rather than the ModState means that the mod can be rebuilt without
+    // losing the information.
     this.set_string("AR session name", "session" + XORRandom(1000000)); // used to give a name to each match's save file
     this.set_u16("AR match number", 0); // used to give a name to each match's save file
     this.set_u16("AR recording number", 0);
 }
 
 void onTick(CRules@ this) {
-    STATE.update();
+    STATE.onTick();
 }
 
 void onRestart(CRules@ this) {
     this.set_u16("AR match number", this.get_u16("AR match number") + 1);
-
-    if (STATE.autorecord) {
-        getNet().server_SendMsg("autorecord kicking in!");
-        STATE.startRecording();
-    }
+    STATE.onRestart();
 }
 
 void onStateChange(CRules@ this, const u8 oldState) {
-    // Detect game over
-    if (this.getCurrentState() == GAME_OVER &&
-            oldState != GAME_OVER) {
-        if (STATE.autorecord) {
-            getNet().server_SendMsg("Game over detected - autorecord saving match!");
-            // Last match was being recorded so save it
-            STATE.stopRecording();
-            STATE.saveRecording();
-        }
+    if (this.getCurrentState() == GAME_OVER && oldState != GAME_OVER) {
+        STATE.onGameOver();
     }
 }
 
@@ -575,32 +899,42 @@ bool onServerProcessChat(CRules@ this, const string& in text_in, string& out tex
         if (tokens[0] == "!autorecord") {
             // enabling autorecord makes the mod automatically record matches when they start, and saves them when they finish
             log("onServerProcessChat", "autorecord command received");
-            HandleAutoRecordCmd();
+            STATE.startAutorecording();
         }
         else if (tokens[0] == "!stopautorecord") {
             // enabling autorecord makes the mod automatically record matches when they start, and saves them when they finish
             log("onServerProcessChat", "stopautorecord command received");
-            HandleStopAutoRecordCmd();
+            STATE.stopAutorecording();
+        }
+        if (tokens[0] == "!autoreplay") {
+            // enabling autorecord makes the mod automatically record matches when they start, and saves them when they finish
+            log("onServerProcessChat", "autoreplay command received");
+            STATE.startAutoreplaying("match", 100);
+        }
+        else if (tokens[0] == "!stopautoreplay") {
+            // enabling autorecord makes the mod automatically record matches when they start, and saves them when they finish
+            log("onServerProcessChat", "stopautoplay command received");
+            STATE.stopAutoreplaying();
         }
         else if (tokens[0] == "!record") {
             log("onServerProcessChat", "record command received");
-            HandleRecordCmd();
+            STATE.startRecording();
         }
         else if (tokens[0] == "!stoprecording") {
             log("onServerProcessChat", "stoprecording command received");
-            HandleStopRecordingCmd();
+            STATE.stopRecording();
         }
         else if (tokens[0] == "!replay") {
             log("onServerProcessChat", "replay command received");
-            HandleReplayCmd();
+            STATE.startReplaying();
         }
         else if (tokens[0] == "!stopreplay") {
             log("onServerProcessChat", "stopreplay command received");
-            HandleStopReplayCmd();
+            STATE.stopReplaying();
         }
         else if (tokens[0] == "!save") {
             log("onServerProcessChat", "save command received");
-            HandleSaveCmd();
+            STATE.saveRecording();
         }
         else if (tokens[0] == "!allspec") {
             log("onServerProcessChat", "allspec command received");
@@ -611,82 +945,13 @@ bool onServerProcessChat(CRules@ this, const string& in text_in, string& out tex
     return true;
 }
 
-void HandleAutoRecordCmd() {
-    log("HandleAutoRecordCmd", "Called");
-    if (STATE.isRecording()) {
-        STATE.stopRecording();
-    }
-    else if (STATE.isReplaying()) {
-        STATE.stopReplaying();
-    }
-
-    getNet().server_SendMsg("Enabling autorecord!");
-    STATE.autorecord = true;
-    LoadNextMap();
-}
-
-void HandleStopAutoRecordCmd() {
-    log("HandleStopAutoRecordCmd", "Called");
-    if (!STATE.autorecord) {
-        getNet().server_SendMsg("Not actually in autorecord mode.");
-    }
-
-    getNet().server_SendMsg("Stopping autorecord.");
-    STATE.autorecord = false;
-}
-
-void HandleRecordCmd() {
-    log("HandleRecordCmd", "Called");
-    if (STATE.isRecording()) {
-        getNet().server_SendMsg("Already recording!");
-    }
-    else {
-        STATE.startRecording();
-    }
-}
-
-void HandleStopRecordingCmd() {
-    log("HandleStopRecordingCmd", "Called");
-    if (!STATE.isRecording()) {
-        getNet().server_SendMsg("Not actually recording!");
-    }
-    else {
-        STATE.stopRecording();
-    }
-}
-
-void HandleReplayCmd() {
-    log("HandleReplayCmd", "Called");
-    if (STATE.isReplaying()) {
-        getNet().server_SendMsg("Already replaying!");
-    }
-    else {
-        STATE.startReplaying();
-    }
-}
-
-void HandleStopReplayCmd() {
-    log("HandleStopReplayCmd", "Called");
-    if (!STATE.isReplaying()) {
-        getNet().server_SendMsg("Not actually replaying!");
-    }
-    else {
-        STATE.stopReplaying();
-    }
-}
-
-void HandleSaveCmd() {
-    if (!STATE.hasRecording) {
-        getNet().server_SendMsg("No replay to save!");
-    }
-    else {
-        STATE.saveRecording();
-    }
-}
-
-/// Helpers
+// Helpers
 string stringVec2f(Vec2f v) {
     return "Vec2f(" + v.x + ", " + v.y + ")";
+}
+
+void ServerMsg(string msg) {
+    getNet().server_SendMsg("ActionReplay: " + msg);
 }
 
 void ForceToSpectate(CRules@ this, CPlayer@ player) {
@@ -717,4 +982,23 @@ void KillAllBlobs() {
             blob.server_Die();
         }
     }
+}
+
+bool StringCheck(string str, int i, string sub) {
+    // Returns true/false if the given string contains a substring 'sub' starting at index i
+    if (str.length() < sub.length()) {
+        log("stringCheck", "WARN str.length < sub.length");
+        return false;
+    }
+
+    string strSub = str.substr(i, sub.length());
+    /*
+    log("stringCheck", "i = " + i +
+            ", str.length = " + str.length() +
+            ", sub = " + sub +
+            ", i+sub.length = " + i + sub.length() +
+            ", strSub = " + strSub
+            );
+            */
+    return strSub == sub;
 }
